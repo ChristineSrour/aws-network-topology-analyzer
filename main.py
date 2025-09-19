@@ -22,8 +22,9 @@ from aws_network_discovery.utils.logger import setup_logging
 @click.option('--config', '-c', type=click.Path(exists=True), help='Configuration file path')
 @click.option('--log-level', default='INFO', type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR']))
 @click.option('--log-file', type=click.Path(), help='Log file path')
+@click.option('--no-ssl-verify', is_flag=True, help='Disable SSL certificate verification for AWS SDK calls (not recommended)')
 @click.pass_context
-def cli(ctx, config, log_level, log_file):
+def cli(ctx, config, log_level, log_file, no_ssl_verify):
     """AWS Network Discovery and Analysis Tool"""
     ctx.ensure_object(dict)
     
@@ -32,6 +33,8 @@ def cli(ctx, config, log_level, log_file):
     
     # Load configuration
     ctx.obj['config'] = Config(config_file=config)
+    # SSL verification flag
+    ctx.obj['no_ssl_verify'] = bool(no_ssl_verify)
 
 
 @cli.command()
@@ -58,7 +61,13 @@ def discover(ctx, profile, regions, output_file, accounts, role_arn_template):
             credentials = authenticator.get_credentials()
 
             cross_account_roles = _build_cross_account_roles(account_list, role_arn_template)
-            orchestrator = DiscoveryOrchestrator(credentials, config, profile_name=prof, cross_account_roles=cross_account_roles)
+            orchestrator = DiscoveryOrchestrator(
+                credentials,
+                config,
+                profile_name=prof,
+                cross_account_roles=cross_account_roles,
+                no_ssl_verify=ctx.obj.get('no_ssl_verify', False)
+            )
             profile_data = orchestrator.discover_all(region_list, account_list)
 
             # Merge into combined dataset
