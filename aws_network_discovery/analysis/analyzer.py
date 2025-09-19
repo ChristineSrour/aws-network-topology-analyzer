@@ -376,10 +376,12 @@ class NetworkAnalyzer:
             'compliance_issues': [],
         }
         
-        # Get all security groups
+        # Get all security groups with region and account info
         all_sgs = []
         for region, sgs in self.network_data.get('security_groups', {}).items():
-            all_sgs.extend(sgs)
+            for sg in sgs:
+                sg['Region'] = region  # Ensure region is set
+                all_sgs.append(sg)
         
         # Get all resources that use security groups
         sg_usage = {}
@@ -393,12 +395,32 @@ class NetworkAnalyzer:
         for sg in all_sgs:
             sg_id = sg.get('GroupId')
             
-            # Check if overly permissive
-            if self._is_overly_permissive_sg(sg):
+            # Check if overly permissive AND in use (only include used ones)
+            if self._is_overly_permissive_sg(sg) and sg_id in sg_usage:
+                attached_resources = sg_usage[sg_id]
+                
+                # Get account name from the first attached resource (they should all be in same account)
+                account_name = attached_resources[0].get('profile', 'Unknown') if attached_resources else 'Unknown'
+                account_id = attached_resources[0].get('account_id', 'Unknown') if attached_resources else 'Unknown'
+                
+                # Create resource summary
+                resource_summary = []
+                for resource in attached_resources:
+                    resource_summary.append({
+                        'type': resource.get('type'),
+                        'id': resource.get('id'),
+                        'name': resource.get('name', resource.get('id')),
+                        'region': resource.get('region'),
+                    })
+                
                 security_analysis['overly_permissive_sgs'].append({
                     'sg_id': sg_id,
                     'sg_name': sg.get('GroupName'),
                     'region': sg.get('Region'),
+                    'account_id': account_id,
+                    'account_name': account_name,
+                    'attached_resources': resource_summary,
+                    'resource_count': len(attached_resources),
                     'issues': self._get_sg_permission_issues(sg),
                 })
             
@@ -408,6 +430,7 @@ class NetworkAnalyzer:
                     'sg_id': sg_id,
                     'sg_name': sg.get('GroupName'),
                     'region': sg.get('Region'),
+                    'account_id': sg.get('OwnerId', 'Unknown'),
                 })
         
         # Analyze open ports
@@ -465,6 +488,7 @@ class NetworkAnalyzer:
                 'is_third_party': path.is_third_party,
                 'confidence_score': path.confidence_score,
                 'validation_results': path.validation_results,
+                'security_assessment': self._assess_path_security(path),
             }
             serializable_paths.append(path_dict)
         
@@ -1035,3 +1059,123 @@ class NetworkAnalyzer:
                         analysis['all_ports_open'] = True
         
         return analysis
+    
+    def _assess_path_security(self, path: CommunicationPath) -> Dict[str, Any]:
+        """Assess the security posture of a communication path"""
+        assessment = {
+            'status': 'GOOD',  # GOOD, PERMISSIVE, TOO_OPEN, CRITICAL
+            'risk_level': 'LOW',  # LOW, MEDIUM, HIGH, CRITICAL
+            'issues': [],
+            'recommendations': []
+        }
+        
+        # Get source and destination rules
+        source_rule = path.validation_results.get('source_rule', {}) if path.validation_results else {}
+        dest_rule = path.validation_results.get('destination_rule', {}) if path.validation_results else {}
+        
+        # Check for overly permissive protocols
+        if source_rule.get('protocol') == '-1' or dest_rule.get('protocol') == '-1':
+            assessment['issues'].append("Allows all protocols")
+            assessment['status'] = 'TOO_OPEN'
+            assessment['risk_level'] = 'HIGH'
+            assessment['recommendations'].append("Restrict to specific protocols only")
+        
+        # Check for wide port ranges
+        source_port_range = source_rule.get('port_range', '')
+        dest_port_range = dest_rule.get('port_range', '')
+        
+        if self._is_wide_port_range(source_port_range) or self._is_wide_port_range(dest_port_range):
+            assessment['issues'].append("Wide port range allowed")
+            if assessment['status'] == 'GOOD':
+                assessment['status'] = 'PERMISSIVE'
+                assessment['risk_level'] = 'MEDIUM'
+            assessment['recommendations'].append("Narrow down port ranges to specific services")
+        
+        # Check for sensitive ports exposed
+        sensitive_ports = ['22', '3389', '1433', '3306', '5432', '27017']
+        for port in sensitive_ports:
+            if port in source_port_range or port in dest_port_range:
+                port_name = self._get_port_service_name(port)
+                assessment['issues'].append(f"Sensitive port {port} ({port_name}) exposed")
+                if assessment['risk_level'] in ['LOW', 'MEDIUM']:
+                    assessment['risk_level'] = 'HIGH'
+                if assessment['status'] == 'GOOD':
+                    assessment['status'] = 'PERMISSIVE'
+                assessment['recommendations'].append(f"Secure {port_name} access with additional controls")
+        
+        # Check cross-account/cross-region communications
+        if path.is_cross_account:
+            assessment['issues'].append("Cross-account communication")
+            if assessment['status'] == 'GOOD':
+                assessment['status'] = 'PERMISSIVE'
+            assessment['recommendations'].append("Verify cross-account trust and access patterns")
+        
+        if path.is_cross_region:
+            assessment['issues'].append("Cross-region communication")
+            assessment['recommendations'].append("Consider data residency and latency implications")
+        
+        # Check if source/destination security groups are overly permissive
+        source_sgs = path.source_resource.get('security_groups', [])
+        dest_sgs = path.destination_resource.get('security_groups', [])
+        
+        permissive_sgs = [sg['sg_id'] for sg in self.analysis_results.get('security_analysis', {}).get('overly_permissive_sgs', [])]
+        
+        for sg_id in source_sgs + dest_sgs:
+            if sg_id in permissive_sgs:
+                assessment['issues'].append(f"Uses overly permissive security group: {sg_id}")
+                assessment['status'] = 'TOO_OPEN'
+                assessment['risk_level'] = 'CRITICAL'
+                assessment['recommendations'].append(f"Review and tighten security group {sg_id}")
+        
+        # Final status determination
+        if len(assessment['issues']) == 0:
+            assessment['status'] = 'GOOD'
+            assessment['risk_level'] = 'LOW'
+        elif assessment['risk_level'] == 'CRITICAL':
+            assessment['status'] = 'CRITICAL'
+        
+        return assessment
+    
+    def _is_wide_port_range(self, port_range: str) -> bool:
+        """Check if port range is considered wide/permissive"""
+        if not port_range or port_range == 'unknown':
+            return False
+        
+        # Check for common wide ranges
+        wide_ranges = ['0-65535', '1-65535', '1024-65535']
+        if port_range in wide_ranges:
+            return True
+        
+        # Check if range spans more than 100 ports
+        if '-' in port_range:
+            try:
+                start, end = port_range.split('-')
+                if int(end) - int(start) > 100:
+                    return True
+            except (ValueError, AttributeError):
+                pass
+        
+        return False
+    
+    def _get_port_service_name(self, port: str) -> str:
+        """Get common service name for port number"""
+        port_services = {
+            '22': 'SSH',
+            '23': 'Telnet',
+            '25': 'SMTP',
+            '53': 'DNS',
+            '80': 'HTTP',
+            '110': 'POP3',
+            '143': 'IMAP',
+            '443': 'HTTPS',
+            '993': 'IMAPS',
+            '995': 'POP3S',
+            '1433': 'SQL Server',
+            '3306': 'MySQL',
+            '3389': 'RDP',
+            '5432': 'PostgreSQL',
+            '5984': 'CouchDB',
+            '6379': 'Redis',
+            '27017': 'MongoDB',
+        }
+        return port_services.get(port, 'Unknown Service')

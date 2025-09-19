@@ -130,6 +130,10 @@ class ReportGenerator:
                 'NACLs_Valid': path['validation_results'].get('nacls_valid', 'Unknown'),
                 'Route_Tables_Valid': path['validation_results'].get('route_tables_valid', 'Unknown'),
                 'Firewall_Rules_Valid': path['validation_results'].get('firewall_rules_valid', 'Unknown'),
+                'Security_Status': path.get('security_assessment', {}).get('status', 'Unknown'),
+                'Risk_Level': path.get('security_assessment', {}).get('risk_level', 'Unknown'),
+                'Security_Issues': '; '.join(path.get('security_assessment', {}).get('issues', [])),
+                'Security_Recommendations': '; '.join(path.get('security_assessment', {}).get('recommendations', [])),
                 'Path_Chain': ' -> '.join([step['description'] for step in path['path_chain']]),
             }
             flattened_paths.append(flat_path)
@@ -202,10 +206,46 @@ class ReportGenerator:
     def _generate_security_analysis_csv(self, security_analysis: Dict[str, Any], output_dir: str) -> None:
         """Generate CSV for security analysis"""
         
-        # Overly permissive security groups
+        # Overly permissive security groups (only those in use)
         if security_analysis.get('overly_permissive_sgs'):
             csv_file = Path(output_dir) / "overly_permissive_security_groups.csv"
-            df = pd.DataFrame(security_analysis['overly_permissive_sgs'])
+            
+            # Flatten the data for CSV export
+            flattened_sgs = []
+            for sg in security_analysis['overly_permissive_sgs']:
+                # Create a base record for the security group
+                base_record = {
+                    'SG_ID': sg['sg_id'],
+                    'SG_Name': sg['sg_name'],
+                    'Region': sg['region'],
+                    'Account_ID': sg['account_id'],
+                    'Account_Name': sg['account_name'],
+                    'Resource_Count': sg['resource_count'],
+                    'Issues': '; '.join(sg['issues']),
+                }
+                
+                # Add one row per attached resource
+                if sg.get('attached_resources'):
+                    for resource in sg['attached_resources']:
+                        record = base_record.copy()
+                        record.update({
+                            'Attached_Resource_Type': resource['type'],
+                            'Attached_Resource_ID': resource['id'],
+                            'Attached_Resource_Name': resource['name'],
+                            'Attached_Resource_Region': resource['region'],
+                        })
+                        flattened_sgs.append(record)
+                else:
+                    # If no attached resources, still include the SG
+                    base_record.update({
+                        'Attached_Resource_Type': 'None',
+                        'Attached_Resource_ID': 'None',
+                        'Attached_Resource_Name': 'None',
+                        'Attached_Resource_Region': 'None',
+                    })
+                    flattened_sgs.append(base_record)
+            
+            df = pd.DataFrame(flattened_sgs)
             df.to_csv(csv_file, index=False, sep=self.config.output.csv_delimiter)
             logger.info(f"Overly permissive SGs CSV saved to {csv_file}")
         
@@ -305,6 +345,10 @@ class ReportGenerator:
                 'Is_Cross_Account': path['is_cross_account'],
                 'Is_Cross_Region': path['is_cross_region'],
                 'Confidence_Score': path['confidence_score'],
+                'Security_Status': path.get('security_assessment', {}).get('status', 'Unknown'),
+                'Risk_Level': path.get('security_assessment', {}).get('risk_level', 'Unknown'),
+                'Security_Issues': '; '.join(path.get('security_assessment', {}).get('issues', [])),
+                'Security_Recommendations': '; '.join(path.get('security_assessment', {}).get('recommendations', [])),
             }
             flattened_paths.append(flat_path)
         
