@@ -43,10 +43,14 @@ def cli(ctx, config, log_level, log_file, no_ssl_verify):
 @click.option('--output-file', '-o', default='network_data.json', help='Output JSON file path')
 @click.option('--accounts', help='Comma-separated list of account IDs (optional)')
 @click.option('--role-arn-template', help='AssumeRole ARN template for cross-account discovery, e.g., arn:aws:iam::{account}:role/NetworkAuditRole')
+@click.option('--no-ssl-verify', is_flag=True, help='Disable SSL certificate verification for AWS SDK calls (not recommended)')
 @click.pass_context
-def discover(ctx, profile, regions, output_file, accounts, role_arn_template):
+def discover(ctx, profile, regions, output_file, accounts, role_arn_template, no_ssl_verify):
     """Discover AWS network resources and save to JSON file"""
     config = ctx.obj['config']
+    # Allow subcommand-level flag to set global if used here
+    if no_ssl_verify:
+        ctx.obj['no_ssl_verify'] = True
     
     try:
         # Parse regions and accounts
@@ -97,8 +101,9 @@ def analyse(ctx, input_file, output_dir):
 @cli.command()
 @click.option('--input-file', '-i', required=True, type=click.Path(exists=True), help='Input JSON file path')
 @click.option('--output-dir', '-o', default='./reports', help='Output directory for reports')
+@click.option('--no-ssl-verify', is_flag=True, help='Disable SSL certificate verification for AWS SDK calls (not recommended)')
 @click.pass_context
-def analyze(ctx, input_file, output_dir):
+def analyze(ctx, input_file, output_dir, no_ssl_verify):
     """Analyze network data from JSON file and generate reports"""
     config = ctx.obj['config']
     
@@ -128,8 +133,9 @@ def analyze(ctx, input_file, output_dir):
 @click.option('--accounts', help='Comma-separated list of account IDs (optional)')
 @click.option('--data-file', help='Intermediate data file name (default: network_data.json)')
 @click.option('--role-arn-template', help='AssumeRole ARN template for cross-account discovery, e.g., arn:aws:iam::{account}:role/NetworkAuditRole')
+@click.option('--no-ssl-verify', is_flag=True, help='Disable SSL certificate verification for AWS SDK calls (not recommended)')
 @click.pass_context
-def full(ctx, profile, regions, output_dir, accounts, data_file, role_arn_template):
+def full(ctx, profile, regions, output_dir, accounts, data_file, role_arn_template, no_ssl_verify):
     """Run full discovery and analysis pipeline"""
     config = ctx.obj['config']
     
@@ -151,7 +157,13 @@ def full(ctx, profile, regions, output_dir, accounts, data_file, role_arn_templa
             credentials = authenticator.get_credentials()
 
             cross_account_roles = _build_cross_account_roles(account_list, role_arn_template)
-            orchestrator = DiscoveryOrchestrator(credentials, config, profile_name=prof, cross_account_roles=cross_account_roles)
+            orchestrator = DiscoveryOrchestrator(
+                credentials,
+                config,
+                profile_name=prof,
+                cross_account_roles=cross_account_roles,
+                no_ssl_verify=ctx.obj.get('no_ssl_verify', False)
+            )
             profile_data = orchestrator.discover_all(region_list, account_list)
             combined_data = _merge_discovery_datasets(combined_data, profile_data)
         
