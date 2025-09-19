@@ -17,6 +17,10 @@ from aws_network_discovery.collectors.rds_collector import RDSCollector
 from aws_network_discovery.collectors.elb_collector import ELBCollector
 from aws_network_discovery.collectors.security_groups_collector import SecurityGroupsCollector
 from aws_network_discovery.collectors.vpc_collector import VPCCollector
+from aws_network_discovery.collectors.cross_account_collector import CrossAccountCollector
+from aws_network_discovery.collectors.nacl_collector import NACLCollector
+from aws_network_discovery.collectors.route_table_collector import RouteTableCollector
+from aws_network_discovery.collectors.network_firewall_collector import NetworkFirewallCollector
 
 
 logger = logging.getLogger(__name__)
@@ -37,18 +41,21 @@ class DiscoveryOrchestrator:
     10. Network Firewall Rules
     """
     
-    def __init__(self, credentials: Dict[str, str], config: Config, profile_name: Optional[str] = None):
+    def __init__(self, credentials: Dict[str, str], config: Config, profile_name: Optional[str] = None, cross_account_roles: Optional[Dict[str, str]] = None):
         """
         Initialize discovery orchestrator
         
         Args:
             credentials: AWS credentials dictionary
             config: Configuration object
+            profile_name: AWS profile name
+            cross_account_roles: Dictionary mapping account_id -> role_arn for cross-account access
         """
         self.credentials = credentials
         self.config = config
         self.authenticator = None
         self.profile_name = profile_name
+        self.cross_account_roles = cross_account_roles or {}
         self.collectors = {}
         self.discovery_metadata = {
             'start_time': None,
@@ -58,6 +65,7 @@ class DiscoveryOrchestrator:
             'accounts': [],
             'resource_counts': {},
             'errors': [],
+            'cross_account_enabled': bool(cross_account_roles),
         }
         
     def _initialize_authenticator(self, profile_name: str = None) -> None:
@@ -119,29 +127,33 @@ class DiscoveryOrchestrator:
             logger.info("Phase 2: Discovering Security Groups")
             discovery_data.update(self._discover_security_groups(regions, account_ids))
             
-            # Phase 3: VPC Components (Subnets, NACLs, VPCs, Route Tables, etc.)
+            # Phase 3: VPC Components (Subnets, VPCs, etc.)
             logger.info("Phase 3: Discovering VPC Components")
             discovery_data.update(self._discover_vpc_components(regions, account_ids))
             
-            # Phase 4: Network Interfaces (ENIs)
-            logger.info("Phase 4: Discovering Network Interfaces")
+            # Phase 4: Network ACLs
+            logger.info("Phase 4: Discovering Network ACLs")
+            discovery_data.update(self._discover_network_acls(regions, account_ids))
+            
+            # Phase 5: Route Tables
+            logger.info("Phase 5: Discovering Route Tables")
+            discovery_data.update(self._discover_route_tables(regions, account_ids))
+            
+            # Phase 6: Network Interfaces (ENIs)
+            logger.info("Phase 6: Discovering Network Interfaces")
             discovery_data.update(self._discover_network_interfaces(regions, account_ids))
             
-            # Phase 5: Transit Gateway Components
-            logger.info("Phase 5: Discovering Transit Gateway Components")
-            discovery_data.update(self._discover_transit_gateways(regions, account_ids))
-            
-            # Phase 6: VPC Endpoints
-            logger.info("Phase 6: Discovering VPC Endpoints")
-            # VPC Endpoints are already collected in VPC collector
-            
-            # Phase 7: Third-Party Services
-            logger.info("Phase 7: Discovering Third-Party Services")
-            discovery_data.update(self._discover_third_party_services(regions, account_ids))
+            # Phase 7: Cross-Account Resources (VPC Peering, Transit Gateways, etc.)
+            logger.info("Phase 7: Discovering Cross-Account Resources")
+            discovery_data.update(self._discover_cross_account_resources(regions, account_ids))
             
             # Phase 8: Network Firewall Rules
             logger.info("Phase 8: Discovering Network Firewall Rules")
             discovery_data.update(self._discover_network_firewalls(regions, account_ids))
+            
+            # Phase 9: Third-Party Services
+            logger.info("Phase 9: Discovering Third-Party Services")
+            discovery_data.update(self._discover_third_party_services(regions, account_ids))
             
             # Calculate resource counts
             self._calculate_resource_counts(discovery_data)
@@ -166,7 +178,16 @@ class DiscoveryOrchestrator:
             'elb': ELBCollector(self.authenticator, self.config),
             'security_groups': SecurityGroupsCollector(self.authenticator, self.config),
             'vpc': VPCCollector(self.authenticator, self.config),
+            'nacl': NACLCollector(self.authenticator, self.config),
+            'route_tables': RouteTableCollector(self.authenticator, self.config),
+            'network_firewall': NetworkFirewallCollector(self.authenticator, self.config),
         }
+        
+        # Initialize cross-account collector if cross-account roles are provided
+        if self.cross_account_roles:
+            cross_account_collector = CrossAccountCollector(self.authenticator, self.config)
+            cross_account_collector.set_cross_account_roles(self.cross_account_roles)
+            self.collectors['cross_account'] = cross_account_collector
     
     def _discover_application_resources(self, regions: List[str], account_ids: Optional[List[str]]) -> Dict[str, Any]:
         """Discover application resources (EC2, Lambda, RDS, etc.)"""
@@ -201,10 +222,22 @@ class DiscoveryOrchestrator:
         return {'security_groups': sg_data}
     
     def _discover_vpc_components(self, regions: List[str], account_ids: Optional[List[str]]) -> Dict[str, Any]:
-        """Discover VPC components (VPCs, Subnets, Route Tables, NACLs, etc.)"""
+        """Discover VPC components (VPCs, Subnets, etc.)"""
         logger.info("Collecting VPC components...")
         vpc_data = self.collectors['vpc'].collect(regions, account_ids)
         return {'vpc_components': vpc_data}
+    
+    def _discover_network_acls(self, regions: List[str], account_ids: Optional[List[str]]) -> Dict[str, Any]:
+        """Discover Network Access Control Lists"""
+        logger.info("Collecting Network ACLs...")
+        nacl_data = self.collectors['nacl'].collect(regions, account_ids)
+        return {'network_acls': nacl_data}
+    
+    def _discover_route_tables(self, regions: List[str], account_ids: Optional[List[str]]) -> Dict[str, Any]:
+        """Discover Route Tables"""
+        logger.info("Collecting Route Tables...")
+        route_table_data = self.collectors['route_tables'].collect(regions, account_ids)
+        return {'route_tables': route_table_data}
     
     def _discover_network_interfaces(self, regions: List[str], account_ids: Optional[List[str]]) -> Dict[str, Any]:
         """Discover Elastic Network Interfaces (ENIs)"""
@@ -212,11 +245,21 @@ class DiscoveryOrchestrator:
         # For now, return placeholder
         return {'network_interfaces': {region: [] for region in regions}}
     
-    def _discover_transit_gateways(self, regions: List[str], account_ids: Optional[List[str]]) -> Dict[str, Any]:
-        """Discover Transit Gateways and their attachments"""
-        # This would be implemented as a separate collector
-        # For now, return placeholder
-        return {'transit_gateways': {region: [] for region in regions}}
+    def _discover_cross_account_resources(self, regions: List[str], account_ids: Optional[List[str]]) -> Dict[str, Any]:
+        """Discover cross-account connectivity resources"""
+        if 'cross_account' not in self.collectors:
+            logger.info("Cross-account discovery not enabled - no cross-account roles configured")
+            return {'cross_account_resources': {}}
+        
+        logger.info("Collecting cross-account resources...")
+        cross_account_data = self.collectors['cross_account'].collect(regions, account_ids)
+        return {'cross_account_resources': cross_account_data}
+    
+    def _discover_network_firewalls(self, regions: List[str], account_ids: Optional[List[str]]) -> Dict[str, Any]:
+        """Discover AWS Network Firewall rules"""
+        logger.info("Collecting Network Firewalls...")
+        firewall_data = self.collectors['network_firewall'].collect(regions, account_ids)
+        return {'network_firewalls': firewall_data}
     
     def _discover_third_party_services(self, regions: List[str], account_ids: Optional[List[str]]) -> Dict[str, Any]:
         """Discover third-party service connections (MongoDB Atlas, Databricks, etc.)"""
@@ -229,12 +272,6 @@ class DiscoveryOrchestrator:
             third_party['databricks'] = self._discover_databricks(regions)
         
         return {'third_party_services': third_party}
-    
-    def _discover_network_firewalls(self, regions: List[str], account_ids: Optional[List[str]]) -> Dict[str, Any]:
-        """Discover AWS Network Firewall rules"""
-        # This would be implemented as a separate collector
-        # For now, return placeholder
-        return {'network_firewalls': {region: [] for region in regions}}
     
     # Removed placeholder collectors for RDS/ELB; using dedicated collectors
     
@@ -264,11 +301,41 @@ class DiscoveryOrchestrator:
             lambda_count += len(region_data)
         counts['lambda_functions'] = lambda_count
         
+        # Count RDS instances
+        rds_count = 0
+        for region_data in discovery_data.get('rds_instances', {}).values():
+            rds_count += len(region_data)
+        counts['rds_instances'] = rds_count
+        
+        # Count Load Balancers
+        elb_count = 0
+        for region_data in discovery_data.get('load_balancers', {}).values():
+            elb_count += len(region_data)
+        counts['load_balancers'] = elb_count
+        
         # Count Security Groups
         sg_count = 0
         for region_data in discovery_data.get('security_groups', {}).values():
             sg_count += len(region_data)
         counts['security_groups'] = sg_count
+        
+        # Count Network ACLs
+        nacl_count = 0
+        for region_data in discovery_data.get('network_acls', {}).values():
+            nacl_count += len(region_data)
+        counts['network_acls'] = nacl_count
+        
+        # Count Route Tables
+        rt_count = 0
+        for region_data in discovery_data.get('route_tables', {}).values():
+            rt_count += len(region_data)
+        counts['route_tables'] = rt_count
+        
+        # Count Network Firewalls
+        nfw_count = 0
+        for region_data in discovery_data.get('network_firewalls', {}).values():
+            nfw_count += len(region_data)
+        counts['network_firewalls'] = nfw_count
         
         # Count VPC components
         vpc_counts = {}
@@ -278,6 +345,21 @@ class DiscoveryOrchestrator:
                     vpc_counts[component_type] = 0
                 vpc_counts[component_type] += len(components)
         counts.update(vpc_counts)
+        
+        # Count cross-account resources
+        cross_account_data = discovery_data.get('cross_account_resources', {})
+        if cross_account_data:
+            cross_account_counts = {}
+            for resource_type, account_data in cross_account_data.items():
+                if isinstance(account_data, dict):
+                    total_count = 0
+                    for account_id, region_data in account_data.items():
+                        if isinstance(region_data, dict):
+                            for region, resources in region_data.items():
+                                if isinstance(resources, list):
+                                    total_count += len(resources)
+                    cross_account_counts[resource_type] = total_count
+            counts['cross_account_resources'] = cross_account_counts
         
         self.discovery_metadata['resource_counts'] = counts
     

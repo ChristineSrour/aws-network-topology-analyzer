@@ -39,8 +39,9 @@ def cli(ctx, config, log_level, log_file):
 @click.option('--regions', default='us-east-1,eu-west-1,eu-central-1', help='Comma-separated list of regions')
 @click.option('--output-file', '-o', default='network_data.json', help='Output JSON file path')
 @click.option('--accounts', help='Comma-separated list of account IDs (optional)')
+@click.option('--role-arn-template', help='AssumeRole ARN template for cross-account discovery, e.g., arn:aws:iam::{account}:role/NetworkAuditRole')
 @click.pass_context
-def discover(ctx, profile, regions, output_file, accounts):
+def discover(ctx, profile, regions, output_file, accounts, role_arn_template):
     """Discover AWS network resources and save to JSON file"""
     config = ctx.obj['config']
     
@@ -56,7 +57,8 @@ def discover(ctx, profile, regions, output_file, accounts):
             authenticator = SSOAuthenticator(prof)
             credentials = authenticator.get_credentials()
 
-            orchestrator = DiscoveryOrchestrator(credentials, config, profile_name=prof)
+            cross_account_roles = _build_cross_account_roles(account_list, role_arn_template)
+            orchestrator = DiscoveryOrchestrator(credentials, config, profile_name=prof, cross_account_roles=cross_account_roles)
             profile_data = orchestrator.discover_all(region_list, account_list)
 
             # Merge into combined dataset
@@ -116,8 +118,9 @@ def analyze(ctx, input_file, output_dir):
 @click.option('--output-dir', '-o', default='./reports', help='Output directory for reports')
 @click.option('--accounts', help='Comma-separated list of account IDs (optional)')
 @click.option('--data-file', help='Intermediate data file name (default: network_data.json)')
+@click.option('--role-arn-template', help='AssumeRole ARN template for cross-account discovery, e.g., arn:aws:iam::{account}:role/NetworkAuditRole')
 @click.pass_context
-def full(ctx, profile, regions, output_dir, accounts, data_file):
+def full(ctx, profile, regions, output_dir, accounts, data_file, role_arn_template):
     """Run full discovery and analysis pipeline"""
     config = ctx.obj['config']
     
@@ -138,7 +141,8 @@ def full(ctx, profile, regions, output_dir, accounts, data_file):
             authenticator = SSOAuthenticator(prof)
             credentials = authenticator.get_credentials()
 
-            orchestrator = DiscoveryOrchestrator(credentials, config, profile_name=prof)
+            cross_account_roles = _build_cross_account_roles(account_list, role_arn_template)
+            orchestrator = DiscoveryOrchestrator(credentials, config, profile_name=prof, cross_account_roles=cross_account_roles)
             profile_data = orchestrator.discover_all(region_list, account_list)
             combined_data = _merge_discovery_datasets(combined_data, profile_data)
         
@@ -192,6 +196,21 @@ def _merge_discovery_datasets(base: dict, incoming: dict) -> dict:
             return b
 
     return merge(base, incoming)
+
+
+def _build_cross_account_roles(account_list: Optional[List[str]], role_arn_template: Optional[str]) -> Optional[dict]:
+    """Build a mapping of account_id -> role_arn using a template.
+
+    Example template: arn:aws:iam::{account}:role/NetworkAuditRole
+    """
+    if not account_list or not role_arn_template:
+        return {}
+
+    mapping = {}
+    for acct in account_list:
+        role_arn = role_arn_template.replace('{account}', acct)
+        mapping[acct] = role_arn
+    return mapping
 
 
 @cli.command()

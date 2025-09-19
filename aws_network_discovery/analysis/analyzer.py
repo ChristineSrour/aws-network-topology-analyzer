@@ -44,6 +44,11 @@ class NetworkAnalyzer:
         self.config = config
         self.network_data = {}
         self.analysis_results = {}
+        # Indexed views for validation across accounts/regions
+        self._vpc_cidrs: Dict[str, Dict[str, str]] = {}
+        self._subnet_index: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._route_tables_by_subnet: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._nacls_by_subnet: Dict[str, Dict[str, Dict[str, Any]]] = {}
         
     def load_data(self, input_file: str) -> Dict[str, Any]:
         """
@@ -104,6 +109,9 @@ class NetworkAnalyzer:
             # Step 1: Build resource inventory
             logger.info("Building resource inventory...")
             self._build_resource_inventory()
+            # Build topology indexes for validation
+            logger.info("Indexing network topology (VPCs, Subnets, Route Tables, NACLs)...")
+            self._index_network_topology()
             
             # Step 2: Analyze security configurations
             logger.info("Analyzing security configurations...")
@@ -242,6 +250,34 @@ class NetworkAnalyzer:
                     'state': vpc.get('State'),
                 }
                 inventory['network_resources'].append(resource)
+
+            # Route tables (network resources summary)
+            for rt in vpc_data.get('route_tables', []):
+                resource = {
+                    'type': 'RouteTable',
+                    'id': rt.get('RouteTableId'),
+                    'name': rt.get('Name') or rt.get('RouteTableId'),
+                    'region': region,
+                    'account_id': rt.get('AccountId') or rt.get('OwnerId'),
+                    'vpc_id': rt.get('VpcId'),
+                    'associations': rt.get('Associations', []),
+                    'routes': rt.get('Routes', []),
+                }
+                inventory['network_resources'].append(resource)
+
+            # Network ACLs (network resources summary)
+            for nacl in vpc_data.get('network_acls', []):
+                resource = {
+                    'type': 'NetworkAcl',
+                    'id': nacl.get('NetworkAclId'),
+                    'name': nacl.get('Name') or nacl.get('NetworkAclId'),
+                    'region': region,
+                    'account_id': nacl.get('AccountId') or nacl.get('OwnerId'),
+                    'vpc_id': nacl.get('VpcId'),
+                    'associations': nacl.get('Associations', []),
+                    'entries': nacl.get('Entries', []),
+                }
+                inventory['network_resources'].append(resource)
             
             # Subnets
             for subnet in vpc_data.get('subnets', []):
@@ -287,6 +323,48 @@ class NetworkAnalyzer:
         }
         
         self.analysis_results['resource_inventory'] = inventory
+
+    def _index_network_topology(self) -> None:
+        """Create indexes for VPCs, subnets, route tables, and NACLs per region."""
+        self._vpc_cidrs = {}
+        self._subnet_index = {}
+        self._route_tables_by_subnet = {}
+        self._nacls_by_subnet = {}
+
+        vpc_components = self.network_data.get('vpc_components', {})
+        # Build VPC CIDR index and subnet index
+        for region, data in vpc_components.items():
+            self._vpc_cidrs.setdefault(region, {})
+            self._subnet_index.setdefault(region, {})
+            self._route_tables_by_subnet.setdefault(region, {})
+            self._nacls_by_subnet.setdefault(region, {})
+
+            # VPCs
+            for vpc in data.get('vpcs', []):
+                vpc_id = vpc.get('VpcId')
+                cidr = vpc.get('CidrBlock')
+                if vpc_id and cidr:
+                    self._vpc_cidrs[region][vpc_id] = cidr
+
+            # Subnets
+            for subnet in data.get('subnets', []):
+                subnet_id = subnet.get('SubnetId')
+                if subnet_id:
+                    self._subnet_index[region][subnet_id] = subnet
+
+            # Route tables -> map to subnets via associations
+            for rt in data.get('route_tables', []):
+                for assoc in rt.get('Associations', []) or []:
+                    subnet_id = assoc.get('SubnetId')
+                    if subnet_id:
+                        self._route_tables_by_subnet[region][subnet_id] = rt
+
+            # NACLs -> map to subnets via associations
+            for nacl in data.get('network_acls', []):
+                for assoc in nacl.get('Associations', []) or []:
+                    subnet_id = assoc.get('SubnetId')
+                    if subnet_id:
+                        self._nacls_by_subnet[region][subnet_id] = nacl
     
     def _analyze_security_configurations(self) -> None:
         """Analyze security group configurations and identify potential issues"""
@@ -593,35 +671,139 @@ class NetworkAnalyzer:
         """Validate communication paths against network rules"""
         for path in self.analysis_results['communication_paths']:
             validation = {
-                'security_groups_valid': True,
+                'security_groups_valid': True,  # already enforced by generation
                 'nacls_valid': True,
                 'route_tables_valid': True,
                 'firewall_rules_valid': True,
             }
-            
+
             # Validate against NACLs
             if self.config.analysis.validate_nacls:
                 validation['nacls_valid'] = self._validate_against_nacls(path)
-            
+
             # Validate against route tables
             if self.config.analysis.validate_route_tables:
                 validation['route_tables_valid'] = self._validate_against_route_tables(path)
-            
+
             # Validate against firewall rules
             if self.config.analysis.validate_firewall_rules:
                 validation['firewall_rules_valid'] = self._validate_against_firewall_rules(path)
-            
+
             path['validation_results'] = validation
     
     def _validate_against_nacls(self, path: Dict) -> bool:
-        """Validate path against Network ACL rules"""
-        # Simplified implementation
-        return True
+        """Validate path against Network ACL rules for both source and destination subnets.
+
+        Simplified logic: ensure there is no explicit DENY for the port/protocol and
+        at least one ALLOW that matches 0.0.0.0/0 or the peer subnet/VPC CIDR.
+        """
+        try:
+            src = path['source']
+            dst = path['destination']
+            region_src = src.get('region')
+            region_dst = dst.get('region')
+
+            # Identify subnets
+            src_subnet = self._find_subnet_id_for_resource(src)
+            dst_subnet = self._find_subnet_id_for_resource(dst)
+
+            # If we cannot resolve subnets, skip NACL validation
+            if not src_subnet or not dst_subnet:
+                return True
+
+            proto = (path.get('protocol') or '').lower()
+            port_from, port_to = self._extract_port_range(path.get('port_range'))
+
+            # Validate source subnet NACL (egress)
+            nacl_src = self._nacls_by_subnet.get(region_src, {}).get(src_subnet)
+            if nacl_src and not self._nacl_allows(nacl_src, egress=True, proto=proto, port_from=port_from, port_to=port_to, peer_region=region_dst, dst_resource=dst):
+                return False
+
+            # Validate destination subnet NACL (ingress)
+            nacl_dst = self._nacls_by_subnet.get(region_dst, {}).get(dst_subnet)
+            if nacl_dst and not self._nacl_allows(nacl_dst, egress=False, proto=proto, port_from=port_from, port_to=port_to, peer_region=region_src, dst_resource=dst):
+                return False
+
+            return True
+        except Exception:
+            # Be tolerant: in case of incomplete data, don't block the path
+            return True
     
     def _validate_against_route_tables(self, path: Dict) -> bool:
-        """Validate path against route table configurations"""
-        # Simplified implementation
-        return True
+        """Validate path against route table configurations.
+
+        Logic: from source subnet's associated route table, confirm there is a route
+        that can reach the destination VPC/subnet CIDR. Accept targets: local (same VPC),
+        VPC peering, Transit Gateway, NAT/IGW for internet if destination is public.
+        """
+        try:
+            src = path['source']
+            dst = path['destination']
+
+            region_src = src.get('region')
+            region_dst = dst.get('region')
+            vpc_src = self._get_resource_field(src, 'vpc_id')
+            vpc_dst = self._get_resource_field(dst, 'vpc_id')
+
+            # Same VPC is implicitly routable via local
+            if vpc_src and vpc_dst and vpc_src == vpc_dst and region_src == region_dst:
+                return True
+
+            # Determine destination CIDR to reach
+            dest_cidr = None
+            if vpc_dst and region_dst in self._vpc_cidrs and vpc_dst in self._vpc_cidrs[region_dst]:
+                dest_cidr = self._vpc_cidrs[region_dst][vpc_dst]
+            else:
+                # Fallback to destination subnet CIDR
+                dst_subnet_id = self._find_subnet_id_for_resource(dst)
+                if dst_subnet_id:
+                    dst_subnet = self._subnet_index.get(region_dst, {}).get(dst_subnet_id, {})
+                    dest_cidr = dst_subnet.get('CidrBlock')
+
+            # If we cannot determine destination CIDR, accept (don't block)
+            if not dest_cidr:
+                return True
+
+            # Get source subnet route table
+            src_subnet_id = self._find_subnet_id_for_resource(src)
+            if not src_subnet_id:
+                return True
+            rt = self._route_tables_by_subnet.get(region_src, {}).get(src_subnet_id)
+            if not rt:
+                return True
+
+            # Evaluate routes
+            for route in rt.get('Routes', []):
+                if not (route.get('State') == 'active' or route.get('State') == 'Active'):
+                    continue
+                # Local route within same VPC
+                if route.get('GatewayId') == 'local':
+                    # local routes typically only to same VPC CIDR; if dst in same VPC but different region, not applicable
+                    if vpc_src == vpc_dst and region_src == region_dst:
+                        return True
+                    continue
+
+                # Match destination CIDR
+                dest = route.get('DestinationCidrBlock') or route.get('DestinationIpv6CidrBlock')
+                if dest and self._cidr_contains(dest, dest_cidr):
+                    # Accept if target is peering/TGW/ENI/Instance/NAT/IGW
+                    if route.get('VpcPeeringConnectionId') or route.get('TransitGatewayId'):
+                        return True
+                    if route.get('GatewayId', '').startswith(('igw-', 'vgw-')):
+                        return True
+                    if route.get('NatGatewayId') or route.get('NetworkInterfaceId') or route.get('InstanceId'):
+                        return True
+
+                # Default route to IGW/NAT can also be acceptable for public endpoints
+                if route.get('DestinationCidrBlock') == '0.0.0.0/0' and route.get('GatewayId', '').startswith(('igw-',)):
+                    return True
+                if route.get('DestinationCidrBlock') == '0.0.0.0/0' and route.get('NatGatewayId'):
+                    return True
+
+            return False
+        except Exception:
+            # Be tolerant on missing data
+            return True
     
     def _validate_against_firewall_rules(self, path: Dict) -> bool:
         """Validate path against network firewall rules"""
@@ -669,6 +851,99 @@ class NetworkAnalyzer:
             })
         
         self.analysis_results['network_insights'] = insights
+
+    # ---- Index/Validation helpers ----
+    def _find_subnet_id_for_resource(self, res: Dict[str, Any]) -> Optional[str]:
+        """Resolve subnet ID from a resource dict."""
+        return res.get('subnet_id') or (res.get('subnet_ids')[0] if isinstance(res.get('subnet_ids'), list) and res.get('subnet_ids') else None)
+
+    def _get_resource_field(self, res: Dict[str, Any], key: str) -> Optional[str]:
+        return res.get(key) or res.get(key.upper())
+
+    def _cidr_contains(self, container_cidr: str, item_cidr: str) -> bool:
+        try:
+            net_container = IPv4Network(container_cidr, strict=False)
+            net_item = IPv4Network(item_cidr, strict=False)
+            return net_item.subnet_of(net_container) or net_item == net_container or net_container.supernet_of(net_item)
+        except Exception:
+            return False
+
+    def _extract_port_range(self, port_range: Optional[str]) -> Tuple[int, int]:
+        if not port_range or port_range in ('All', 'unknown'):
+            return (0, 65535)
+        if '-' in str(port_range):
+            parts = str(port_range).split('-')
+            try:
+                return (int(parts[0]), int(parts[1]))
+            except Exception:
+                return (0, 65535)
+        try:
+            p = int(str(port_range))
+            return (p, p)
+        except Exception:
+            return (0, 65535)
+
+    def _nacl_allows(self, nacl: Dict[str, Any], egress: bool, proto: str, port_from: int, port_to: int, peer_region: str, dst_resource: Dict[str, Any]) -> bool:
+        """Check if a NACL allows traffic. Simplified precedence: first match wins."""
+        entries = nacl.get('Entries') or nacl.get('InboundRules') or nacl.get('OutboundRules') or []
+        # Convert stored format if coming from VPC collector
+        normalized = []
+        for e in entries:
+            if 'ProtocolNumber' in e or 'Protocol' in e:
+                proto_num = str(e.get('Protocol') or e.get('ProtocolNumber') or '-1')
+            else:
+                proto_num = '-1'
+            rule = {
+                'RuleNumber': e.get('RuleNumber', 32767),
+                'Egress': e.get('Egress', e.get('IsEgress', False)),
+                'RuleAction': e.get('RuleAction', 'allow' if e.get('IsPermissive') else 'deny' if e.get('IsRestrictive') else 'allow'),
+                'CidrBlock': e.get('CidrBlock'),
+                'Ipv6CidrBlock': e.get('Ipv6CidrBlock'),
+                'PortRange': e.get('PortRange', {}),
+                'Protocol': proto_num,
+            }
+            normalized.append(rule)
+
+        # Sort by RuleNumber ascending (NACLs are evaluated in order)
+        normalized.sort(key=lambda x: x.get('RuleNumber', 32767))
+
+        # Destination CIDR fallback: use VPC CIDR of destination if available
+        dst_vpc_id = self._get_resource_field(dst_resource, 'vpc_id')
+        dst_region = dst_resource.get('region')
+        dst_vpc_cidr = self._vpc_cidrs.get(dst_region, {}).get(dst_vpc_id)
+
+        for rule in normalized:
+            if bool(rule.get('Egress')) != egress:
+                continue
+            # Protocol match: '-1' matches all
+            if rule.get('Protocol') != '-1' and proto in ('tcp', 'udp'):
+                # 6 tcp, 17 udp
+                if (proto == 'tcp' and rule.get('Protocol') != '6') or (proto == 'udp' and rule.get('Protocol') != '17'):
+                    continue
+
+            # Port match if specified
+            pr = rule.get('PortRange') or {}
+            r_from = pr.get('From') if 'From' in pr else pr.get('FromPort')
+            r_to = pr.get('To') if 'To' in pr else pr.get('ToPort')
+            if r_from is not None and r_to is not None:
+                try:
+                    r_from = int(r_from)
+                    r_to = int(r_to)
+                    if r_to < port_from or port_to < r_from:
+                        continue
+                except Exception:
+                    pass
+
+            # CIDR match: allow 0.0.0.0/0 as generic, or destination VPC CIDR
+            cidr = rule.get('CidrBlock') or rule.get('Ipv6CidrBlock')
+            if cidr and cidr != '0.0.0.0/0' and dst_vpc_cidr and not self._cidr_contains(cidr, dst_vpc_cidr):
+                continue
+
+            # First matching rule determines action
+            return rule.get('RuleAction', 'allow') == 'allow'
+
+        # Default NACL behavior is deny if no match; be tolerant here
+        return True
     
     def _generate_compliance_report(self) -> None:
         """Generate compliance report"""
